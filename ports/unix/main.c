@@ -456,6 +456,17 @@ STATIC void sys_set_excecutable(char *argv0) {
 MP_NOINLINE int main_(int argc, char **argv);
 
 int main(int argc, char **argv) {
+    FILE *file;
+    unsigned int mpyheapsize;
+    char filePath[] = "/tmp/mpyheapsize";
+    file = fopen(filePath, "r");
+    if (file != NULL) {
+        if (fscanf(file, "%u", &mpyheapsize) == 1) {
+            heap_size *= mpyheapsize;
+        }
+        fclose(file);
+    }
+
     #if MICROPY_PY_THREAD
     mp_thread_init();
     #endif
