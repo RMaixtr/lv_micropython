@@ -179,7 +179,7 @@ STATIC mp_uint_t webrepl_read(mp_obj_t self_in, void *buf, mp_uint_t size, int *
     mp_uint_t out_sz;
     do {
         out_sz = _webrepl_read(self_in, buf, size, errcode);
-    } while (out_sz == -2);
+    } while (out_sz == (mp_uint_t)-2);
     return out_sz;
 }
 
