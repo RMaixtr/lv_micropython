@@ -35,6 +35,9 @@
 // Variant-specific definitions.
 #include "mpconfigvariant.h"
 
+#define MICROPY_PY_OS_DUPTERM (1)
+#define MICROPY_PY_WEBREPL (1)
+
 #ifndef MICROPY_CONFIG_ROM_LEVEL
 #define MICROPY_CONFIG_ROM_LEVEL (MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES)
 #endif
