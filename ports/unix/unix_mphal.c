@@ -184,9 +184,59 @@ main_term:;
     return c;
 }
 
+static int capture_enabled = 0;
+static char *capture_buffer = NULL;
+static size_t capture_size = 0;
+static size_t capture_capacity = 0;
+
+// 启用/禁用捕获
+void mpy_stdout_capture_enable(void) {
+    capture_enabled = 1;
+    capture_size = 0;
+    if (capture_buffer) {
+        capture_buffer[0] = '\0';
+    }
+}
+
+void mpy_stdout_capture_disable(void) {
+    capture_enabled = 0;
+}
+
+// 获取捕获内容
+const char* mpy_stdout_capture_get(void) {
+    return capture_buffer ? capture_buffer : "";
+}
+
+// 清空缓冲区
+void mpy_stdout_capture_clear(void) {
+    capture_size = 0;
+    if (capture_buffer) {
+        capture_buffer[0] = '\0';
+    }
+}
+
+// 释放缓冲区
+void mpy_stdout_capture_free(void) {
+    free(capture_buffer);
+    capture_buffer = NULL;
+    capture_size = 0;
+    capture_capacity = 0;
+}
+
 mp_uint_t mp_hal_stdout_tx_strn(const char *str, size_t len) {
     ssize_t ret;
-    MP_HAL_RETRY_SYSCALL(ret, write(STDOUT_FILENO, str, len), {});
+    if (capture_enabled) {
+        if (capture_size + len >= capture_capacity) {
+            capture_capacity = (capture_size + len) * 2 + 4096;
+            capture_buffer = realloc(capture_buffer, capture_capacity);
+        }
+        memcpy(capture_buffer + capture_size, str, len);
+        capture_size += len;
+        capture_buffer[capture_size] = '\0';
+        ret = len; // 假装写入成功
+    } else {
+        MP_HAL_RETRY_SYSCALL(ret, write(STDOUT_FILENO, str, len), {});
+    }
     mp_uint_t written = ret < 0 ? 0 : ret;
     int dupterm_res = mp_os_dupterm_tx_strn(str, len);
     if (dupterm_res >= 0) {

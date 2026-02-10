@@ -77,8 +77,64 @@ long heap_size = 1024 * 1024 * (sizeof(mp_uint_t) / 4);
 #error "The unix port requires MICROPY_PY_SYS_ARGV=1"
 #endif
 
+// 捕获状态
+static int g_stderr_capture_enabled = 0;
+static char *g_stderr_capture_buffer = NULL;
+static size_t g_stderr_capture_size = 0;
+static size_t g_stderr_capture_capacity = 0;
+
+// 启用捕获
+void mpy_stderr_capture_enable(void) {
+    g_stderr_capture_enabled = 1;
+    g_stderr_capture_size = 0;
+    if (g_stderr_capture_buffer) {
+        g_stderr_capture_buffer[0] = '\0';
+    }
+}
+
+// 禁用捕获
+void mpy_stderr_capture_disable(void) {
+    g_stderr_capture_enabled = 0;
+}
+
+// 获取捕获内容
+const char* mpy_stderr_capture_get(void) {
+    return g_stderr_capture_buffer ? g_stderr_capture_buffer : "";
+}
+
+// 清空缓冲区
+void mpy_stderr_capture_clear(void) {
+    g_stderr_capture_size = 0;
+    if (g_stderr_capture_buffer) {
+        g_stderr_capture_buffer[0] = '\0';
+    }
+}
+
+// 释放缓冲区（在 cleanup 时调用）
+void mpy_stderr_capture_free(void) {
+    free(g_stderr_capture_buffer);
+    g_stderr_capture_buffer = NULL;
+    g_stderr_capture_size = 0;
+    g_stderr_capture_capacity = 0;
+}
+
+// 修改后的 stderr_print_strn
 static void stderr_print_strn(void *env, const char *str, size_t len) {
     (void)env;
+    
+    // 如果启用捕获，写入缓冲区而不是 stderr
+    if (g_stderr_capture_enabled) {
+        if (g_stderr_capture_size + len >= g_stderr_capture_capacity) {
+            g_stderr_capture_capacity = (g_stderr_capture_size + len) * 2 + 4096;
+            g_stderr_capture_buffer = realloc(g_stderr_capture_buffer, g_stderr_capture_capacity);
+        }
+        memcpy(g_stderr_capture_buffer + g_stderr_capture_size, str, len);
+        g_stderr_capture_size += len;
+        g_stderr_capture_buffer[g_stderr_capture_size] = '\0';
+        return; // 跳过原始 write 和 dupterm
+    }
+    
+    // 原始行为
     ssize_t ret;
     MP_HAL_RETRY_SYSCALL(ret, write(STDERR_FILENO, str, len), {});
     mp_os_dupterm_tx_strn(str, len);
@@ -116,7 +172,7 @@ static int handle_uncaught_exception(mp_obj_base_t *exc) {
 // except if FORCED_EXIT bit is set then script raised SystemExit and the
 // value of the exit is in the lower 8 bits of the return value
 static int execute_from_lexer(int source_kind, const void *source, mp_parse_input_kind_t input_kind, bool is_repl) {
-    mp_hal_set_interrupt_char(CHAR_CTRL_C);
+    // mp_hal_set_interrupt_char(CHAR_CTRL_C);
 
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
@@ -311,6 +367,13 @@ static int do_file(const char *file) {
 }
 
 static int do_str(const char *str) {
+    return execute_from_lexer(LEX_SRC_STR, str, MP_PARSE_FILE_INPUT, false);
+}
+
+int exec_file(const char *file){
+    return execute_from_lexer(LEX_SRC_FILENAME, file, MP_PARSE_FILE_INPUT, false);
+}
+int exec_str(const char *str){
     return execute_from_lexer(LEX_SRC_STR, str, MP_PARSE_FILE_INPUT, false);
 }
 
@@ -802,4 +865,266 @@ void nlr_jump_fail(void *val) {
     #endif
     fprintf(stderr, "FATAL: uncaught NLR %p\n", val);
     exit(1);
+}
+
+
+// 全局状态标志，用于跟踪 MicroPython 环境是否已初始化
+static int have_mpy_env = 0;
+
+// GC 堆状态
+#if MICROPY_ENABLE_GC
+#if !MICROPY_GC_SPLIT_HEAP
+static char *g_heap = NULL;
+#else
+static char *g_heaps[MICROPY_GC_SPLIT_HEAP_N_HEAPS];
+#endif
+#endif
+
+// Python 栈状态
+#if MICROPY_ENABLE_PYSTACK
+static mp_obj_t g_pystack[1024];
+#endif
+
+/**
+ * 初始化一个新的 MicroPython 环境
+ * 
+ * 该函数执行 MicroPython 运行时的一次性初始化。
+ * 必须在调用任何其他 MicroPython 函数之前调用。
+ * 
+ * @param heapsize 为垃圾回收分配的堆大小（以字节为单位）
+ * 
+ * 注意：此函数不处理以下事项：
+ * - 命令行选项解析（pre_process_options）
+ * - 设置 sys.executable（需要 argv[0]）
+ * - 文件/字符串特定的执行设置
+ * 这些应在调用 run_mpy_env() 之前单独处理。
+ */
+void new_mpy_env(int heapsize) {
+    // 防止重复初始化
+    if (have_mpy_env) {
+        return;
+    }
+
+    #if MICROPY_PY_THREAD
+    mp_thread_init();
+    #endif
+
+    // Define a reasonable stack limit to detect stack overflow.
+    if(heap_size == 0)
+        heap_size = 40000 * (sizeof(void *) / 4);
+    #if defined(__arm__) && !defined(__thumb2__)
+    // ARM (non-Thumb) architectures require more stack.
+    stack_size *= 2;
+    #endif
+
+    // We should capture stack top ASAP after start, and it should be
+    // captured guaranteedly before any other stack variables are allocated.
+    // For this, actual main (renamed main_) should not be inlined into
+    // this function. main_() itself may have other functions inlined (with
+    // their own stack variables), that's why we need this main/main_ split.
+    mp_cstack_init_with_sp_here(heap_size);
+
+    // 设置信号处理，防止在 SIGPIPE 时静默终止
+    #ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+    #endif
+
+    // 分配并初始化 GC 堆
+    #if MICROPY_ENABLE_GC
+    #if !MICROPY_GC_SPLIT_HEAP
+    g_heap = malloc(heapsize);
+    if (g_heap == NULL) {
+        // 内存分配失败 - 无法继续
+        return;
+    }
+    gc_init(g_heap, g_heap + heapsize);
+    #else
+    // 为需要多个堆区域的系统配置分割堆
+    assert(MICROPY_GC_SPLIT_HEAP_N_HEAPS > 0);
+    long multi_heap_size = heapsize / MICROPY_GC_SPLIT_HEAP_N_HEAPS;
+    for (size_t i = 0; i < MICROPY_GC_SPLIT_HEAP_N_HEAPS; i++) {
+        g_heaps[i] = malloc(multi_heap_size);
+        if (i == 0) {
+            gc_init(g_heaps[i], g_heaps[i] + multi_heap_size);
+        } else {
+            gc_add(g_heaps[i], g_heaps[i] + multi_heap_size);
+        }
+    }
+    #endif
+    #endif
+
+    // 初始化 Python 栈以实现高效的对象分配
+    #if MICROPY_ENABLE_PYSTACK
+    mp_pystack_init(g_pystack, &g_pystack[MP_ARRAY_SIZE(g_pystack)]);
+    #endif
+
+    // 初始化核心 MicroPython 运行时
+    mp_init();
+
+    // 如果启用了 POSIX VFS，则挂载 VFS 到根目录
+    #if MICROPY_VFS_POSIX
+    {
+        mp_obj_t args[2] = {
+            MP_OBJ_TYPE_GET_SLOT(&mp_type_vfs_posix, make_new)(&mp_type_vfs_posix, 0, 0, NULL),
+            MP_OBJ_NEW_QSTR(MP_QSTR__slash_),
+        };
+        mp_vfs_mount(2, args, (mp_map_t *)&mp_const_empty_map);
+        MP_STATE_VM(vfs_cur) = MP_STATE_VM(vfs_mount_table);
+    }
+    #endif
+
+    // 设置 sys.path，包含基于环境的搜索路径
+    {
+        mp_sys_path = mp_obj_new_list(0, NULL);
+        mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR_));
+
+        char *home = getenv("HOME");
+        char *path = getenv("MICROPYPATH");
+        if (path == NULL) {
+            path = MICROPY_PY_SYS_PATH_DEFAULT;
+        }
+        if (*path == PATHLIST_SEP_CHAR) {
+            ++path;
+        }
+        static bool path_remaining;
+        path_remaining = *path;
+        while (path_remaining) {
+            char *path_entry_end = strchr(path, PATHLIST_SEP_CHAR);
+            if (path_entry_end == NULL) {
+                path_entry_end = path + strlen(path);
+                path_remaining = false;
+            }
+            if (path[0] == '~' && path[1] == '/' && home != NULL) {
+                // 将独立的 ~ 扩展为 $HOME
+                int home_l = strlen(home);
+                vstr_t vstr;
+                vstr_init(&vstr, home_l + (path_entry_end - path - 1) + 1);
+                vstr_add_strn(&vstr, home, home_l);
+                vstr_add_strn(&vstr, path + 1, path_entry_end - path - 1);
+                mp_obj_list_append(mp_sys_path, mp_obj_new_str_from_vstr(&vstr));
+            } else {
+                mp_obj_list_append(mp_sys_path, mp_obj_new_str_via_qstr(path, path_entry_end - path));
+            }
+            path = path_entry_end + 1;
+        }
+    }
+
+    // 初始化 sys.argv 为空列表（将由执行函数填充）
+    mp_obj_list_init(MP_OBJ_TO_PTR(mp_sys_argv), 0);
+
+    // 如果启用了覆盖测试功能，则设置覆盖测试函数
+    #if defined(MICROPY_UNIX_COVERAGE)
+    {
+        MP_DECLARE_CONST_FUN_OBJ_0(extra_coverage_obj);
+        MP_DECLARE_CONST_FUN_OBJ_0(extra_cpp_coverage_obj);
+        mp_store_global(MP_QSTR_extra_coverage, MP_OBJ_FROM_PTR(&extra_coverage_obj));
+        mp_store_global(MP_QSTR_extra_cpp_coverage, MP_OBJ_FROM_PTR(&extra_cpp_coverage_obj));
+    }
+    #endif
+
+    // 标记环境已完全初始化
+    have_mpy_env = 1;
+}
+
+/**
+ * 运行 MicroPython 环境
+ * 
+ * 该函数根据当前配置执行 Python 代码。
+ * 默认情况下，它运行交互式 REPL 或从 stdin 执行。
+ * 
+ * 要执行特定文件或字符串，请在此函数之前调用相应的辅助
+ * 函数。执行结果在内部存储。
+ * 
+ * 注意：此函数签名不允许传递执行目标。
+ * 考虑使用额外的辅助函数，如：
+ * - mpy_exec_file(const char *filename)
+ * - mpy_exec_string(const char *code)
+ * 这些函数会在调用 run_mpy_env() 之前设置全局状态。
+ */
+void run_mpy_env() {
+    // 确保环境已初始化
+    if (!have_mpy_env) {
+        return;
+    }
+
+    int inspect = 0;
+    const char *inspect_env = getenv("MICROPYINSPECT");
+    if (inspect_env && inspect_env[0] != '\0') {
+        inspect = 1;
+    }
+
+    // 运行交互式 REPL 或从 stdin 执行
+    if (isatty(0) || inspect) {
+        prompt_read_history();
+        (void)do_repl();
+        prompt_write_history();
+    } else {
+        (void)execute_from_lexer(LEX_SRC_STDIN, NULL, MP_PARSE_FILE_INPUT, false);
+    }
+}
+
+/**
+ * 删除 MicroPython 环境并释放所有资源
+ * 
+ * 该函数执行 MicroPython 运行时的正确清理，
+ * 包括调用 atexit 处理程序、去初始化模块
+ * 以及释放分配的内存。
+ */
+void del_mpy_env() {
+    // 确保环境已初始化
+    if (!have_mpy_env) {
+        return;
+    }
+
+    // 禁用性能分析回调
+    #if MICROPY_PY_SYS_SETTRACE
+    MP_STATE_THREAD(prof_trace_callback) = MP_OBJ_NULL;
+    #endif
+
+    // 如果设置了 sys.atexit 函数，则调用它
+    #if MICROPY_PY_SYS_ATEXIT
+    if (mp_obj_is_callable(MP_STATE_VM(sys_exitfunc))) {
+        mp_call_function_0(MP_STATE_VM(sys_exitfunc));
+    }
+    #endif
+
+    // 如果启用了详细模式，则打印内存信息
+    #if MICROPY_PY_MICROPYTHON_MEM_INFO
+    if (mp_verbose_flag) {
+        mp_micropython_mem_info(0, NULL);
+    }
+    #endif
+
+    // 去初始化硬件模块
+    #if MICROPY_PY_BLUETOOTH
+    void mp_bluetooth_deinit(void);
+    mp_bluetooth_deinit();
+    #endif
+
+    // 去初始化线程支持
+    #if MICROPY_PY_THREAD
+    mp_thread_deinit();
+    #endif
+
+    // 为覆盖分析扫描所有对象
+    #if defined(MICROPY_UNIX_COVERAGE)
+    gc_sweep_all();
+    #endif
+
+    // 去初始化核心 MicroPython 运行时
+    mp_deinit();
+
+    // 释放 GC 堆内存
+    #if MICROPY_ENABLE_GC && !defined(NDEBUG)
+    #if !MICROPY_GC_SPLIT_HEAP
+    free(g_heap);
+    #else
+    for (size_t i = 0; i < MICROPY_GC_SPLIT_HEAP_N_HEAPS; i++) {
+        free(g_heaps[i]);
+    }
+    #endif
+    #endif
+
+    // 标记环境已去初始化
+    have_mpy_env = 0;
 }

@@ -11,4 +11,9 @@ make -C mpy-cross
 
 cd $MICROPYTHON/ports/unix
 
-make VARIANT=$VARIANT
+
+make VARIANT=$VARIANT clean
+
+make VARIANT=$VARIANT -j
+
+#  colormake PROG=libmicropython.so USER_C_MODULES=../../user_modules/ -j

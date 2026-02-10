@@ -32,6 +32,7 @@ QSTR_GLOBAL_DEPENDENCIES += $(VARIANT_DIR)/mpconfigvariant.h
 
 # OS name, for simple autoconfig
 UNAME_S := $(shell uname -s)
+CFLAGS += -fPIC  # 添加在这里
 
 # include py core make definitions
 include $(TOP)/py/py.mk
@@ -42,12 +43,14 @@ GIT_SUBMODULES += lib/berkeley-db-1.xx
 INC +=  -I.
 INC +=  -I$(TOP)
 INC += -I$(BUILD)
+INC += -I/home/aixtr/jyd/LicheeRV-Nano-Build/buildroot/output/host/riscv64-buildroot-linux-musl/sysroot/usr/include
+INC += -I/home/aixtr/jyd/thorvg/src/bindings/capi
 
 # compiler settings
-CWARN = -Wall -Werror
+CWARN = -Wall -Werror -Wno-error=parentheses 
 CWARN += -Wextra -Wno-unused-parameter -Wpointer-arith -Wdouble-promotion -Wfloat-conversion
 CFLAGS += $(INC) $(CWARN) -std=gnu99 -DUNIX $(COPT) -I$(VARIANT_DIR) $(CFLAGS_EXTRA)
-
+CFLAGS += -Wno-double-promotion
 # Debugging/Optimization
 ifdef DEBUG
 COPT ?= -Og
@@ -105,7 +108,7 @@ endif
 LDFLAGS_ARCH = -Wl,-map,$@.map -Wl,-dead_strip
 else
 # Use gcc syntax for map file
-LDFLAGS_ARCH = -Wl,-Map=$@.map,--cref -Wl,--gc-sections
+LDFLAGS_ARCH = -Wl,-Map=$@.map,--cref
 endif
 LDFLAGS += $(LDFLAGS_MOD) $(LDFLAGS_ARCH) -lm $(LDFLAGS_EXTRA)
 
@@ -185,7 +188,18 @@ LIBFFI_LDFLAGS += -ldl
 endif
 
 CFLAGS += $(LIBFFI_CFLAGS) -DMICROPY_PY_FFI=1
-LDFLAGS += $(LIBFFI_LDFLAGS)
+
+# 添加库搜索路径
+LDFLAGS += -L/home/aixtr/jyd/LicheeRV-Nano-Build/buildroot/output/host/riscv64-buildroot-linux-musl/sysroot/usr/lib
+
+# 使用 --whole-archive 强制包含所有静态库符号（关键！）
+LDFLAGS += -Wl,--whole-archive
+LDFLAGS += $(LIBFFI_LDFLAGS)      # 这通常包含 -lffi
+LDFLAGS += /home/aixtr/jyd/thorvg/libthorvg.a
+LDFLAGS += -Wl,--no-whole-archive
+LDFLAGS += -Wl,--export-dynamic
+# 链接其他共享库
+LDFLAGS += -lgomp -latomic -lpthread -lm -lstdc++
 endif
 
 ifeq ($(MICROPY_PY_JNI),1)
@@ -234,6 +248,8 @@ CFLAGS += -DMPZ_DIG_SIZE=16 # force 16 bits to work on both 32 and 64 bit archs
 endif
 
 CXXFLAGS += $(filter-out -Wmissing-prototypes -Wold-style-definition -std=gnu99,$(CFLAGS) $(CXXFLAGS_MOD))
+CFLAGS += -march=rv64gcv
+CXXFLAGS += -march=rv64gcv
 
 ifeq ($(MICROPY_FORCE_32BIT),1)
 RUN_TESTS_MPY_CROSS_FLAGS = --mpy-cross-flags='-march=x86'
@@ -302,3 +318,12 @@ install: $(BUILD)/$(PROG)
 
 uninstall:
 	-rm $(BINDIR)/$(PROG)
+
+
+ifeq ($(findstring .so,$(PROG)),.so)
+# 强制添加 -shared
+LDFLAGS += -shared -Wl,-soname,$(PROG)
+# 确保 main.c 被编译（如果需要保留）
+else
+# 可执行文件模式，无需额外操作
+endif
